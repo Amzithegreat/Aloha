@@ -1,0 +1,778 @@
+// ==UserScript==
+// @name         ALOHA BM Pattern Checker
+// @namespace    local.aloha.bm-pattern-checker
+// @version      1.0.0
+// @description  Show an unverified BM metadata pattern and its evidence.
+// @match        https://www.remotasks.com/lidarlite/*
+// @match        https://remotasks.com/lidarlite/*
+// @run-at       document-start
+// @sandbox      raw
+// @grant        none
+// @noframes
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    const INSTANCE = '__alohaBmPatternCheckerV1';
+    if (window[INSTANCE]) return;
+    window[INSTANCE] = true;
+
+    const ENTRY = '/internal/lidarlite/entry';
+    const nativeFetch = window.fetch;
+    const xhrOpen = XMLHttpRequest.prototype.open;
+    const xhrSend = XMLHttpRequest.prototype.send;
+    const xhrRequests = new WeakMap();
+
+    const own = (obj, key) =>
+        Object.prototype.hasOwnProperty.call(obj, key);
+
+    const nonempty = value =>
+        typeof value === 'string' && value.trim().length > 0;
+
+    const state = {
+        scene: null,
+        generation: 0,
+        result: null,
+        error: '',
+        checking: false,
+        source: '',
+        checkedAt: '',
+        appliedSerial: 0
+    };
+
+    let requestSerial = 0;
+    let fallbackTimer;
+    let manualController;
+    let panel;
+    let root;
+
+    function classify(payload) {
+        if (
+            !payload ||
+            typeof payload !== 'object' ||
+            payload.kind !== 'assignment' ||
+            !payload.assignment ||
+            typeof payload.assignment !== 'object' ||
+            Array.isArray(payload.assignment) ||
+            !nonempty(payload.sceneId)
+        ) {
+            throw new Error('Not a usable task assignment.');
+        }
+
+        const a = payload.assignment;
+        const hasPipeline = own(a, 'pipelineV3HumanNodeId');
+        const validAttempt = nonempty(a.attemptId);
+        const validPipeline =
+            hasPipeline && nonempty(a.pipelineV3HumanNodeId);
+
+        const equal = validAttempt
+            ? a.attemptId === payload.sceneId
+            : null;
+
+        const evidence = {
+            sceneId: payload.sceneId,
+            attemptId: a.attemptId,
+            hasPipeline,
+            pipelineId: a.pipelineV3HumanNodeId,
+            equal,
+            pipelineMatches: validPipeline
+                ? a.pipelineV3HumanNodeId === payload.sceneId
+                : null
+        };
+
+        // The samples came from this project and review level.
+        if (
+            a.projectId !== '6980e0031b0e89af4a42a66b' ||
+            a.reviewLevel !== 'review-v3-L1'
+        ) {
+            return {
+                ...evidence,
+                status: 'unknown',
+                title: 'Unknown',
+                explanation:
+                    'This project or review level is outside the samples used to define the pattern.'
+            };
+        }
+
+        if (validAttempt && equal && !hasPipeline) {
+            return {
+                ...evidence,
+                status: 'possible',
+                title: 'Possible BM',
+                explanation:
+                    'IDs match and the pipeline field is absent. This matches your known BM sample.'
+            };
+        }
+
+        if (
+            validAttempt &&
+            !equal &&
+            validPipeline &&
+            evidence.pipelineMatches
+        ) {
+            return {
+                ...evidence,
+                status: 'normal',
+                title: 'Matches non-BM samples',
+                explanation:
+                    'IDs differ and the pipeline ID matches the scene. This matches both known non-BM samples.'
+            };
+        }
+
+        return {
+            ...evidence,
+            status: 'unknown',
+            title: 'Unknown',
+            explanation: !validAttempt
+                ? 'The attempt ID is missing or invalid.'
+                : 'The metadata does not match either observed pattern. No BM verdict is available.'
+        };
+    }
+
+    function currentScene() {
+        try {
+            const url = new URL(location.href);
+
+            if (!/^\/lidarlite(?:\/|$)/.test(url.pathname)) {
+                return null;
+            }
+
+            const scene = url.searchParams.get('sceneId');
+            return nonempty(scene) ? scene : null;
+        } catch {
+            return null;
+        }
+    }
+
+    function syncScene() {
+        const scene = currentScene();
+        if (scene === state.scene) return;
+
+        clearTimeout(fallbackTimer);
+        manualController?.abort();
+        manualController = undefined;
+
+        Object.assign(state, {
+            scene,
+            generation: state.generation + 1,
+            result: null,
+            error: '',
+            checking: false,
+            source: '',
+            checkedAt: '',
+            appliedSerial: 0
+        });
+
+        render();
+
+        // One fallback read if the site's response was not captured.
+        if (scene) {
+            const generation = state.generation;
+
+            fallbackTimer = setTimeout(() => {
+                syncScene();
+
+                if (
+                    generation === state.generation &&
+                    !state.result &&
+                    !state.checking
+                ) {
+                    void checkCurrentTask();
+                }
+            }, 2500);
+        }
+    }
+
+    function requestContext(input) {
+        syncScene();
+
+        try {
+            const raw = typeof input === 'string'
+                ? input
+                : input instanceof URL
+                    ? input.href
+                    : input?.url;
+
+            if (!raw) return null;
+
+            const url = new URL(raw, location.href);
+
+            if (
+                url.origin !== location.origin ||
+                url.pathname !== ENTRY ||
+                !state.scene ||
+                url.searchParams.get('sceneId') !== state.scene
+            ) {
+                return null;
+            }
+
+            return {
+                scene: state.scene,
+                generation: state.generation,
+                serial: ++requestSerial
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    function isCurrent(context) {
+        syncScene();
+
+        return context &&
+            context.scene === state.scene &&
+            context.generation === state.generation;
+    }
+
+    function accept(payload, context, source) {
+        if (
+            !isCurrent(context) ||
+            context.serial < state.appliedSerial
+        ) {
+            return;
+        }
+
+        // Never show another task's result as the current result.
+        if (payload?.sceneId !== context.scene) {
+            if (!state.result) {
+                state.error =
+                    'The response belongs to another scene. No result was applied.';
+                render();
+            }
+            return;
+        }
+
+        state.result = classify(payload);
+        state.appliedSerial = context.serial;
+        state.error = '';
+        state.source = source;
+        state.checkedAt = new Date().toLocaleTimeString();
+
+        clearTimeout(fallbackTimer);
+        render();
+    }
+
+    function captureFailure(context) {
+        if (!isCurrent(context) || state.result) return;
+
+        state.error =
+            'Could not read the task response. Use “Check current task” to retry.';
+        render();
+    }
+
+    // Read a clone, leaving the site's fetch response untouched.
+    if (typeof nativeFetch === 'function') {
+        window.fetch = function (...args) {
+            let context = null;
+
+            try {
+                context = requestContext(args[0]);
+            } catch {
+                // Observation must not interrupt site requests.
+            }
+
+            const promise = Reflect.apply(nativeFetch, this, args);
+
+            if (context) {
+                void promise
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error('Task request failed.');
+                        }
+                        return response.clone().json();
+                    })
+                    .then(payload =>
+                        accept(payload, context, 'Captured task response')
+                    )
+                    .catch(() => captureFailure(context));
+            }
+
+            return promise;
+        };
+    }
+
+    // Also support app versions that use XMLHttpRequest.
+    XMLHttpRequest.prototype.open = function (...args) {
+        const result = Reflect.apply(xhrOpen, this, args);
+        xhrRequests.set(this, { url: args[1] });
+        return result;
+    };
+
+    XMLHttpRequest.prototype.send = function (...args) {
+        let context = null;
+
+        try {
+            context = requestContext(xhrRequests.get(this)?.url);
+        } catch {
+            // Observe only.
+        }
+
+        if (!context) {
+            return Reflect.apply(xhrSend, this, args);
+        }
+
+        const xhr = this;
+
+        const onEnd = () => {
+            if (!isCurrent(context)) return;
+
+            try {
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    throw new Error('Task request failed.');
+                }
+
+                const payload = xhr.responseType === 'json'
+                    ? xhr.response
+                    : (!xhr.responseType || xhr.responseType === 'text')
+                        ? JSON.parse(xhr.responseText)
+                        : null;
+
+                if (payload) {
+                    accept(payload, context, 'Captured task response');
+                } else {
+                    captureFailure(context);
+                }
+            } catch {
+                captureFailure(context);
+            }
+        };
+
+        xhr.addEventListener('loadend', onEnd, { once: true });
+
+        try {
+            return Reflect.apply(xhrSend, this, args);
+        } catch (error) {
+            xhr.removeEventListener('loadend', onEnd);
+            throw error;
+        }
+    };
+
+    async function checkCurrentTask() {
+        syncScene();
+        if (!state.scene || state.checking) return;
+
+        clearTimeout(fallbackTimer);
+
+        const url = new URL(ENTRY, location.origin);
+        url.searchParams.set('sceneId', state.scene);
+
+        const context = requestContext(url);
+        if (!context) return;
+
+        if (typeof nativeFetch !== 'function') {
+            state.error =
+                'Fetch is unavailable. Reload the page to capture its task response.';
+            render();
+            return;
+        }
+
+        const controller = new AbortController();
+        manualController = controller;
+
+        const timeout = setTimeout(() => controller.abort(), 15000);
+
+        Object.assign(state, {
+            checking: true,
+            error: '',
+            result: null,
+            source: '',
+            checkedAt: ''
+        });
+
+        render();
+
+        try {
+            // Read the current entry only; never submit or alter answers.
+            const response = await Reflect.apply(nativeFetch, window, [
+                url.href,
+                {
+                    method: 'GET',
+                    credentials: 'same-origin',
+                    cache: 'no-store',
+                    headers: { Accept: 'application/json' },
+                    signal: controller.signal
+                }
+            ]);
+
+            if (!response.ok) {
+                throw new Error('Task request failed.');
+            }
+
+            accept(await response.json(), context, 'Current-task check');
+        } catch (error) {
+            if (isCurrent(context)) {
+                state.error = error?.name === 'AbortError'
+                    ? 'The check timed out. You can retry.'
+                    : 'Could not read a valid assignment. Check your session and retry.';
+            }
+        } finally {
+            clearTimeout(timeout);
+
+            if (manualController === controller) {
+                manualController = undefined;
+            }
+
+            if (isCurrent(context)) {
+                state.checking = false;
+                render();
+            }
+        }
+    }
+
+    function shown(value, present = true) {
+        if (!present) return 'Absent';
+        if (value === undefined) return 'Missing';
+        if (value === null) return 'null (present, invalid ID)';
+        if (typeof value !== 'string') return 'Invalid ID type';
+        return value.length
+            ? value
+            : 'Empty string (present, invalid ID)';
+    }
+
+    function render() {
+        if (!root) return;
+
+        const $ = selector => root.querySelector(selector);
+        const result = state.result;
+
+        const title = !state.scene
+            ? 'No task selected'
+            : result?.title || (
+                state.checking
+                    ? 'Checking task…'
+                    : state.error
+                        ? 'Unknown'
+                        : 'Waiting for task data…'
+            );
+
+        $('.verdict').textContent = title;
+        $('.verdict').dataset.state = result?.status || 'unknown';
+
+        $('.summary').textContent = !state.scene
+            ? 'Open a task with a sceneId in its URL.'
+            : result?.explanation ||
+                'Waiting for the current task’s entry response.';
+
+        $('.scene').textContent =
+            result?.sceneId || state.scene || 'Unavailable';
+
+        $('.attempt').textContent =
+            result ? shown(result.attemptId) : 'Not captured';
+
+        $('.pipeline').textContent = result
+            ? shown(result.pipelineId, result.hasPipeline)
+            : 'Not captured';
+
+        $('.equal').textContent =
+            !result || result.equal === null
+                ? 'Unknown'
+                : result.equal ? 'Yes' : 'No';
+
+        $('.pipeline-equal').textContent =
+            !result || result.pipelineMatches === null
+                ? 'Not applicable / unknown'
+                : result.pipelineMatches ? 'Yes' : 'No';
+
+        $('.check').disabled = !state.scene || state.checking;
+        $('.check').textContent =
+            state.checking ? 'Checking…' : 'Check current task';
+
+        $('.source').textContent = state.source
+            ? `${state.source} · ${state.checkedAt}`
+            : '';
+
+        $('.error').textContent = state.error;
+        $('.error').hidden = !state.error;
+    }
+
+    function mount() {
+        if (!document.body || panel) return;
+
+        panel = document.createElement('div');
+        panel.id = 'aloha-bm-pattern-checker';
+        root = panel.attachShadow({ mode: 'open' });
+
+        root.innerHTML = `
+            <style>
+                :host {
+                    all: initial;
+                    position: fixed;
+                    top: 20px;
+                    right: 20px;
+                    z-index: 2147483647;
+                    width: min(360px, calc(100vw - 24px));
+                    font: 13px/1.5 system-ui, sans-serif;
+                    color: #e9edf6;
+                    color-scheme: dark;
+                }
+                * { box-sizing: border-box; }
+                .panel {
+                    background: #141a25;
+                    border: 1px solid #344052;
+                    border-radius: 16px;
+                    box-shadow: 0 16px 50px #0007;
+                    max-height: calc(100dvh - 24px);
+                    overflow: auto;
+                }
+                header {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    padding: 15px;
+                    cursor: grab;
+                    user-select: none;
+                    touch-action: none;
+                }
+                header:active { cursor: grabbing; }
+                .logo {
+                    background: #73e4bf;
+                    color: #102b24;
+                    font-weight: 900;
+                    border-radius: 9px;
+                    padding: 6px;
+                }
+                h1 { margin: 0; font-size: 14px; }
+                .subtitle, .source {
+                    font-size: 11px;
+                    color: #a3aec1;
+                }
+                button {
+                    border: 1px solid #3c485c;
+                    border-radius: 8px;
+                    padding: 8px 11px;
+                    color: #e9edf6;
+                    background: #222c3c;
+                    font: inherit;
+                    cursor: pointer;
+                }
+                button:hover { background: #303e52; }
+                button:disabled { opacity: .5; cursor: default; }
+                button:focus-visible, summary:focus-visible {
+                    outline: 2px solid #73e4bf;
+                    outline-offset: 3px;
+                }
+                .toggle {
+                    margin-left: auto;
+                    width: 32px;
+                    height: 32px;
+                    padding: 0;
+                    font-size: 18px;
+                }
+                .body { padding: 0 15px 15px; }
+                [hidden] { display: none !important; }
+                .verdict {
+                    padding: 10px;
+                    border-radius: 9px;
+                    background: #283447;
+                    font-size: 15px;
+                    font-weight: 750;
+                }
+                .verdict[data-state="possible"] {
+                    color: #ffe09b;
+                    background: #463a20;
+                }
+                .verdict[data-state="normal"] {
+                    color: #a8e8d3;
+                    background: #203b35;
+                }
+                .summary { margin: 10px 0; }
+                .caution {
+                    padding: 10px;
+                    border: 1px solid #394458;
+                    border-radius: 9px;
+                    color: #b7c8e3;
+                    font-size: 12px;
+                }
+                details { margin: 12px 0; }
+                summary { cursor: pointer; color: #c7d7ef; }
+                dl { margin: 10px 0; }
+                dt {
+                    margin-top: 9px;
+                    color: #a3aec1;
+                    font-size: 11px;
+                }
+                dd {
+                    margin: 2px 0;
+                    overflow-wrap: anywhere;
+                    font: 12px/1.5 ui-monospace, monospace;
+                }
+                .check { width: 100%; }
+                .source { margin-top: 8px; }
+                .error { margin: 8px 0; color: #ffc5b8; }
+                .privacy {
+                    margin: 10px 0 0;
+                    font-size: 11px;
+                    color: #a3aec1;
+                }
+            </style>
+
+            <section class="panel" aria-label="BM pattern checker">
+                <header>
+                    <div class="logo" aria-hidden="true">BM?</div>
+                    <div>
+                        <h1>BM Pattern Checker</h1>
+                        <div class="subtitle">ALOHA · Metadata evidence</div>
+                    </div>
+                    <button class="toggle"
+                        title="Minimize panel"
+                        aria-label="Minimize panel"
+                        aria-expanded="true">−</button>
+                </header>
+
+                <div class="body">
+                    <div class="verdict"
+                        role="status"
+                        aria-live="polite"></div>
+
+                    <p class="summary"></p>
+
+                    <div class="caution">
+                        Unverified pattern: 1 known BM and 2 known non-BMs.
+                        A match does not confirm task type.
+                    </div>
+
+                    <details>
+                        <summary>Show ID evidence</summary>
+                        <dl>
+                            <dt>sceneId</dt>
+                            <dd class="scene"></dd>
+
+                            <dt>assignment.attemptId</dt>
+                            <dd class="attempt"></dd>
+
+                            <dt>assignment.pipelineV3HumanNodeId</dt>
+                            <dd class="pipeline"></dd>
+
+                            <dt>attemptId === sceneId</dt>
+                            <dd class="equal"></dd>
+
+                            <dt>pipelineV3HumanNodeId === sceneId</dt>
+                            <dd class="pipeline-equal"></dd>
+                        </dl>
+                    </details>
+
+                    <button class="check">Check current task</button>
+                    <div class="error" role="status" hidden></div>
+                    <div class="source"></div>
+
+                    <p class="privacy">
+                        Reads the current task only. One fallback check runs
+                        if capture is missed. No answers are changed; no data
+                        is sent to third parties or saved.
+                    </p>
+                </div>
+            </section>
+        `;
+
+        document.body.append(panel);
+
+        const $ = selector => root.querySelector(selector);
+
+        $('.check').addEventListener('click', () => {
+            void checkCurrentTask();
+        });
+
+        $('.toggle').addEventListener('click', () => {
+            const body = $('.body');
+            body.hidden = !body.hidden;
+
+            const label = body.hidden
+                ? 'Expand panel'
+                : 'Minimize panel';
+
+            $('.toggle').textContent = body.hidden ? '+' : '−';
+            $('.toggle').title = label;
+            $('.toggle').setAttribute('aria-label', label);
+            $('.toggle').setAttribute(
+                'aria-expanded',
+                String(!body.hidden)
+            );
+
+            keepOnScreen();
+        });
+
+        let drag = null;
+
+        function keepOnScreen(x, y) {
+            const box = panel.getBoundingClientRect();
+
+            const clamp = (value, size, max) =>
+                Math.max(12, Math.min(value, max - size - 12));
+
+            panel.style.right = 'auto';
+            panel.style.left =
+                clamp(x ?? box.left, box.width, innerWidth) + 'px';
+            panel.style.top =
+                clamp(y ?? box.top, box.height, innerHeight) + 'px';
+        }
+
+        const header = $('header');
+
+        header.addEventListener('pointerdown', event => {
+            if (
+                event.button !== 0 ||
+                event.target.closest('button')
+            ) {
+                return;
+            }
+
+            const box = panel.getBoundingClientRect();
+
+            drag = {
+                x: event.clientX - box.left,
+                y: event.clientY - box.top
+            };
+
+            header.setPointerCapture(event.pointerId);
+        });
+
+        header.addEventListener('pointermove', event => {
+            if (drag) {
+                keepOnScreen(
+                    event.clientX - drag.x,
+                    event.clientY - drag.y
+                );
+            }
+        });
+
+        for (const type of [
+            'pointerup',
+            'pointercancel',
+            'lostpointercapture'
+        ]) {
+            header.addEventListener(type, () => {
+                drag = null;
+            });
+        }
+
+        window.addEventListener('resize', () => keepOnScreen());
+
+        syncScene();
+        render();
+    }
+
+    syncScene();
+
+    if (document.body) {
+        mount();
+    } else {
+        const observer = new MutationObserver(() => {
+            if (document.body) {
+                observer.disconnect();
+                mount();
+            }
+        });
+
+        observer.observe(document, {
+            childList: true,
+            subtree: true
+        });
+    }
+
+    window.addEventListener('popstate', syncScene);
+    window.addEventListener('hashchange', syncScene);
+
+    // URL checks only—not repeated network requests.
+    setInterval(syncScene, 750);
+})();
